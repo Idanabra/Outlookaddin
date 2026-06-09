@@ -222,15 +222,22 @@ function emailList(arr) {
 async function readOutlookEmail() {
   const item = Office.context.mailbox.item;
 
-  const [body] = await Promise.all([getMailBodyAsync()]);
+  const plainContent = await getMailBodyAsync();
+
+  // dateTimeCreated is the closest to sentOn available in read mode
+  const sentOn = item.dateTimeCreated
+    ? new Date(item.dateTimeCreated).toISOString()
+    : new Date().toISOString();
 
   return {
-    subject:    item.subject ?? '',
-    from:       item.from?.emailAddress ?? '',
-    to:         emailList(item.to),
-    cc:         emailList(item.cc),
-    bcc:        [], // Not available in read mode — Outlook API restriction
-    body,
+    subject:      item.subject ?? '',
+    messageId:    item.internetMessageId ?? null,
+    from:         item.from?.emailAddress ?? '',
+    to:           emailList(item.to),
+    cc:           emailList(item.cc),
+    bcc:          [],   // Not available in read mode — Outlook API restriction
+    plainContent,
+    sentOn,
   };
 }
 
@@ -245,17 +252,25 @@ async function readOutlookEmail() {
  */
 function buildEmailPayload(email, opp) {
   return {
-    subject:       email.subject,
-    from:          email.from,
-    toRecipients:  email.to,
-    ccRecipients:  email.cc,
-    bccRecipients: email.bcc,
-    body:          email.body,
-    accounts:             [],
-    contacts:             [],
-    individualCustomers:  [],
-    employees:            [],
-    attachments:          [],
+    subject:            email.subject,
+    messageId:          email.messageId,
+    transmissionStatus: 'CREATE',
+    direction:          'INBOUND',
+    dataOrigin:         'MANUAL',
+    isDraft:            false,
+    isAutoReply:        false,
+    isBounce:           false,
+    sentOn:             email.sentOn,
+    from:               email.from,
+    toRecipients:       email.to,
+    ccRecipients:       email.cc,
+    bccRecipients:      email.bcc,
+    plainContent:       email.plainContent,
+    accounts:           [],
+    contacts:           [],
+    individualCustomers: [],
+    employees:          [],
+    attachments:        [],
     relatedData: {
       interactionNumber:         null,
       interactionOutboundNumber: null,
@@ -264,7 +279,7 @@ function buildEmailPayload(email, opp) {
       {
         objectId:  oppUUID(opp),
         displayId: oppDisplayId(opp),
-        type:      '72',       // SAP type code for Opportunity
+        type:      '72',
         role:      'PREDECESSOR',
       },
     ],

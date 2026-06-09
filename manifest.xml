@@ -186,7 +186,7 @@ function oppOwner(o) {
 /**
  * Clean plain text returned by Office.js.
  * Office.js embeds hyperlinks as:  label <url>  or  [label](url)
- * Both formats are stripped, leaving only the visible label (or nothing for icon-only links).
+ * Both patterns are stripped so only visible text remains.
  * @param {string} text
  * @returns {string}
  */
@@ -194,13 +194,15 @@ function cleanPlainText(text) {
   return text
     // [label](url) markdown links → keep label
     .replace(/\[([^\]]*)\]\([^)]*\)/g, '$1')
-    // label <url> inline links → keep label, drop the <url> part
-    .replace(/\s+<(?:https?|mailto|tel)[^>]*>/g, '')
-    // Bare <url> with nothing before it (icon-only links) → remove entirely
+    // "label <url>" inline links → keep label, remove the <url> part (with any leading whitespace)
+    .replace(/[ \t]*<(?:https?|mailto|tel)[^>]*>/g, '')
+    // Remaining bare <url> tags (icon-only links, no label)
     .replace(/<(?:https?|mailto|tel)[^>]*>/g, '')
-    // Normalise Windows line endings → Unix
+    // Normalise Windows CRLF → LF
     .replace(/\r\n/g, '\n')
-    // Collapse more than two consecutive blank lines
+    // Remove lines that contain only whitespace (tabs/spaces) after URL removal
+    .replace(/^[ \t]+$/gm, '')
+    // Collapse 3+ consecutive blank lines into at most 2
     .replace(/\n{3,}/g, '\n\n')
     .trim();
 }
@@ -227,8 +229,8 @@ function getMailBodyTextAsync() {
 
 /**
  * Fetch HTML body from the current mail item.
- * Used as richTextBody so SAP stores formatting, images, and signatures.
- * Non-fatal — resolves null if unavailable so we can skip the field entirely.
+ * SAP stores this as richText (richTextPreSignedURL) when accepted.
+ * Resolves null on failure so we can build a fallback HTML from plain text.
  * @returns {Promise<string|null>}
  */
 function getMailBodyHtmlAsync() {
@@ -237,14 +239,29 @@ function getMailBodyHtmlAsync() {
       Office.CoercionType.Html,
       { asyncContext: null },
       (result) => {
-        if (result.status === Office.AsyncResultStatus.Succeeded && result.value) {
-          resolve(result.value);
-        } else {
-          resolve(null);
-        }
+        resolve(
+          result.status === Office.AsyncResultStatus.Succeeded && result.value
+            ? result.value
+            : null
+        );
       }
     );
   });
+}
+
+/**
+ * Convert plain text to minimal HTML when native HTML fetch fails.
+ * Preserves line breaks and links well enough for SAP to display.
+ * @param {string} plain
+ * @returns {string}
+ */
+function plainToHtml(plain) {
+  const escaped = plain
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/\n/g, '<br>\n');
+  return `<!DOCTYPE html><html><body dir="auto"><p>${escaped}</p></body></html>`;
 }
 
 /**
@@ -341,13 +358,14 @@ function buildEmailPayload(email, opp) {
     ],
   };
 
-  // richTextBody: SAP Sales Cloud V2 stores this as HTML in S3 (richTextPreSignedURL).
-  // Send under both known field names — SAP ignores unrecognised fields so this is safe.
-  // richTextScanStatus: "SUCCESS" in the response confirms SAP accepted the HTML.
-  if (email.richTextBody) {
-    payload.richTextBody = email.richTextBody;
-    payload.htmlBody     = email.richTextBody; // alternative field name some tenants expect
-  }
+  // HTML body — always include, falling back to plain-text-as-HTML if Office.js HTML fetch failed.
+  // We send under all known SAP field names; SAP ignores any it doesn't recognise.
+  // When accepted, the response will show richTextScanStatus: "SUCCESS" and a richTextPreSignedURL.
+  const htmlContent = email.richTextBody || plainToHtml(email.plainContent);
+  payload.richTextBody  = htmlContent;   // primary SAP V2 field
+  payload.richText      = htmlContent;   // alternate spelling seen on some tenants
+  payload.htmlBody      = htmlContent;   // another alternate
+  payload.htmlContent   = htmlContent;   // another alternate
 
   return payload;
 }

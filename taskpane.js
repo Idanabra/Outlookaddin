@@ -4,7 +4,7 @@
 
 'use strict';
 
-const _VERSION = '1.6';
+const _VERSION = '1.8';
 console.log('[SAP Insights] taskpane.js version', _VERSION);
 
 /* ─────────────────────────────────────────────────────────────────────────
@@ -18,7 +18,7 @@ function loadSettings() {
     const raw = localStorage.getItem(STORAGE_KEY);
     if (!raw) return null;
     const s = JSON.parse(raw);
-    if (s.url && s.user && s.pass) return s;
+    if (s.url && s.user && s.pass) return s;  // salesCycleId is optional
   } catch (_) { /* ignore */ }
   return null;
 }
@@ -103,7 +103,12 @@ async function fetchOpportunities(settings, searchQuery = '') {
   const params = new URLSearchParams();
 
   params.set('$top', '100');
-  params.set('$select', 'id,displayId,name,OwnerName,ownerName,owner,LifeCycleStatusCode');
+  params.set('$select', 'id,displayId,name,OwnerName,ownerName,owner,LifeCycleStatusCode,salesCycleCode');
+
+  // Filter by Sales Cycle if configured
+  if (settings.salesCycleId?.trim()) {
+    params.set('$filter', `salesCycleCode eq '${settings.salesCycleId.trim()}'`);
+  }
 
   if (searchQuery.trim()) {
     params.set('$search', searchQuery.trim());
@@ -114,16 +119,23 @@ async function fetchOpportunities(settings, searchQuery = '') {
   const json = await sapFetch(settings, path);
   const all = json?.value ?? json?.data?.value ?? [];
 
+  // Client-side search filter (fallback if $search isn't supported)
+  let results = all;
   if (searchQuery.trim()) {
     const q = searchQuery.trim().toLowerCase();
-    return all.filter(o => {
+    results = all.filter(o => {
       const name   = (o.name  ?? o.Name  ?? '').toLowerCase();
       const dispId = String(o.displayId ?? o.DisplayID ?? o.id ?? '').toLowerCase();
       return name.includes(q) || dispId.includes(q);
     });
   }
 
-  return all;
+  // Sort A–Z by name
+  results.sort((a, b) =>
+    oppName(a).localeCompare(oppName(b), undefined, { sensitivity: 'base' })
+  );
+
+  return results;
 }
 
 /* ─────────────────────────────────────────────────────────────────────────
@@ -150,7 +162,13 @@ function oppUUID(o) {
 }
 
 function oppOwner(o) {
-  return oppField(o, 'OwnerName', 'ownerName', 'owner', 'ResponsibleName', 'SalesRepresentativeName') ?? '—';
+  const raw = oppField(o, 'OwnerName', 'ownerName', 'ResponsibleName', 'SalesRepresentativeName', 'owner');
+  if (raw == null) return null;
+  // SAP sometimes returns owner as a complex object — extract the display string
+  if (typeof raw === 'object') {
+    return raw.content ?? raw.name ?? raw.displayName ?? raw.fullName ?? null;
+  }
+  return String(raw) || null;
 }
 
 /* ─────────────────────────────────────────────────────────────────────────
@@ -216,6 +234,50 @@ function getMailBodyHtmlAsync() {
   });
 }
 
+/**
+ * Resolve cid: inline image references to base64 data URIs.
+ * Requires Mailbox 1.8+ (getAttachmentContentAsync). Gracefully skips if unavailable.
+ * Without this, images in email signatures/bodies show as broken in SAP.
+ */
+async function resolveCidImages(html) {
+  if (!html || !html.includes('cid:')) return html;
+
+  const item = Office.context.mailbox.item;
+  if (typeof item.getAttachmentContentAsync !== 'function') {
+    console.warn('[SAP Insights] getAttachmentContentAsync not available — cid: images will be broken');
+    return html;
+  }
+
+  const inlineAtts = (item.attachments ?? []).filter(a => a.isInline);
+  if (!inlineAtts.length) return html;
+
+  const fetched = await Promise.all(
+    inlineAtts.map(att => new Promise(resolve => {
+      item.getAttachmentContentAsync(att.id, r => {
+        resolve(r.status === Office.AsyncResultStatus.Succeeded
+          ? { att, value: r.value }
+          : null);
+      });
+    }))
+  );
+
+  let out = html;
+  for (const r of fetched) {
+    if (!r?.value?.content) continue;
+    if (r.value.format !== Office.MailboxEnums.AttachmentContentFormat.Base64) continue;
+
+    const dataUri = `data:${r.att.contentType};base64,${r.value.content}`;
+    // cid: references look like: cid:image001.png@01AB...  — match by attachment name
+    const safeName = r.att.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    out = out.replace(
+      new RegExp(`src=["']cid:[^"']*${safeName}[^"']*["']`, 'gi'),
+      () => `src="${dataUri}"`   // arrow fn avoids $ special meaning in replace
+    );
+  }
+
+  return out;
+}
+
 /** Minimal HTML wrapper for plain text — used when HTML fetch fails. */
 function plainToHtml(plain) {
   const paragraphs = plain.split('\n')
@@ -235,10 +297,13 @@ function emailList(arr) {
 async function readOutlookEmail() {
   const item = Office.context.mailbox.item;
 
-  const [plainContent, richTextBody] = await Promise.all([
+  const [plainContent, rawHtml] = await Promise.all([
     getMailBodyTextAsync(),
     getMailBodyHtmlAsync(),
   ]);
+
+  // Replace cid: inline image references with base64 data URIs so SAP can render them
+  const richTextBody = await resolveCidImages(rawHtml);
 
   const sentOn = item.dateTimeCreated
     ? new Date(item.dateTimeCreated).toISOString()
@@ -360,9 +425,10 @@ const app = (() => {
     el('refresh-btn').style.display = 'none';
 
     if (_settings) {
-      el('cfg-url').value  = _settings.url  ?? '';
-      el('cfg-user').value = _settings.user ?? '';
-      el('cfg-pass').value = _settings.pass ?? '';
+      el('cfg-url').value         = _settings.url          ?? '';
+      el('cfg-user').value        = _settings.user         ?? '';
+      el('cfg-pass').value        = _settings.pass         ?? '';
+      el('cfg-sales-cycle').value = _settings.salesCycleId ?? '';
     }
 
     el('cancel-settings-btn').style.display = _settings ? '' : 'none';
@@ -386,13 +452,13 @@ const app = (() => {
 
       const name   = escHtml(oppName(opp));
       const dispId = escHtml(oppDisplayId(opp));
-      const owner  = escHtml(oppOwner(opp));
+      const owner  = oppOwner(opp);
 
       item.innerHTML = `
         <div class="opp-name" title="${name}">${name}</div>
         <div class="opp-meta">
           ${dispId ? `<span class="opp-tag id">ID: ${dispId}</span>` : ''}
-          ${owner !== '—' ? `<span class="opp-tag owner">👤 ${owner}</span>` : ''}
+          ${owner ? `<span class="opp-tag owner">${escHtml(owner)}</span>` : ''}
         </div>`;
 
       item.addEventListener('click', () => selectOpportunity(opp, item));
@@ -492,7 +558,7 @@ const app = (() => {
       el(id).style.borderColor = '';
     });
 
-    _settings = { url, user, pass };
+    _settings = { url, user, pass, salesCycleId: el('cfg-sales-cycle').value.trim() };
     saveSettingsToStorage(_settings);
     showMainView();
     loadOpportunities();
@@ -505,7 +571,7 @@ const app = (() => {
     if (!_settings) { showSettingsView(); return; }
 
     el('save-btn').disabled = true;
-    showStatus('saving', 'Saving to SAP…', `Linking to: ${oppName(_selectedOpp)}`, true);
+    showStatus('saving', 'שומר ב-SAP...', `מקשר ל: ${oppName(_selectedOpp)}`, true);
 
     try {
       // Step 1: Read Outlook email
@@ -544,8 +610,8 @@ const app = (() => {
 
       showStatus(
         'success',
-        'Email saved to SAP',
-        `Linked to opportunity: ${oppName(_selectedOpp)} (${oppDisplayId(_selectedOpp)})`
+        'המייל נשמר ב-SAP',
+        `מזהה מייל: ${emailId || '—'} | הזדמנות: ${oppName(_selectedOpp)} (${oppDisplayId(_selectedOpp)})`
       );
 
       _selectedOpp = null;
